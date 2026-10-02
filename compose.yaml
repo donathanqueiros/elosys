@@ -1,0 +1,10 @@
+services:
+  web:
+    build: ./web
+    ports:
+      - "3000:3000"
+    volumes:
+      - elosys-data:/data
+
+volumes:
+  elosys-data:

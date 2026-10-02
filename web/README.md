@@ -20,6 +20,37 @@ ELOSYS_DB_PATH=/caminho/para/outro.db npm run dev
 Se `elosys.db` não existir ainda, rode o pipeline Python primeiro (ver
 [README raiz](../README.md#rodar-com-banco-de-dados)).
 
+## Rodando com Docker
+
+Na raiz do repositório:
+
+```sh
+docker compose up --build -d
+docker compose logs -f web
+```
+
+Na primeira inicialização, o container baixa `elosys.zip` do Hugging Face,
+confere o SHA-256 publicado no README raiz e extrai `elosys.db` para o volume
+persistente `elosys-data`. Reserve pelo menos **15 GB livres** para o ZIP e o
+banco descompactado. O servidor inicia em http://localhost:3000 após terminar
+o download e a extração. Nas próximas inicializações, reutiliza o banco.
+`docker compose down` preserva o volume; `docker compose down -v` apaga o banco.
+
+Para usar um banco local já disponível:
+
+```sh
+docker build -t elosys-web ./web
+docker run --rm -p 3000:3000 --mount "type=bind,source=$(pwd)/elosys.db,target=/data/elosys.db,readonly" elosys-web
+```
+
+No PowerShell, use `${PWD}/elosys.db` no lugar de `$(pwd)/elosys.db`.
+Abra http://localhost:3000. O banco fica fora da imagem e é montado somente
+para leitura; o container usa `ELOSYS_DB_PATH=/data/elosys.db` por padrão.
+A imagem usa Node 24 e o servidor standalone de produção do Next.js.
+O download também pode usar outro espelho com `ELOSYS_DB_URL` e
+`ELOSYS_DB_SHA256` (SHA-256 do ZIP); o arquivo deve conter `elosys.db` na raiz.
+Essas variáveis só são usadas quando o banco ainda não existe no volume.
+
 ## Como está organizado
 
 - `src/lib/db.ts` — abre o `.db` em modo **readonly** (`better-sqlite3`).
