@@ -26,7 +26,6 @@ fornecedor de campanha) e **3,25 M bens declarados** (R$ 445,5 bilhões,
 patrimônio no registro de candidatura). Banco ~11,4 GB.
 
 ---
-
 ## Rodar com banco de dados
 
 O jeito mais rápido: baixar o banco já pronto (~11,4 GB) e abrir o app web, sem
