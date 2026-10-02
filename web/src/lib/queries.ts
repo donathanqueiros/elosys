@@ -1,5 +1,6 @@
 import { db, hasTable } from "./db";
 import { digitsOnly, normalizeName } from "./normalize";
+import { homeCache, type AssetTotal, type AssetGrowth } from "./home-cache";
 
 export type Provenance = {
   sourceName: string;
@@ -886,26 +887,22 @@ export type TopSupplier = {
   candidacyCount: number;
 };
 
-let cachedExpenseYears: number[] | null = null;
-
 export function getExpenseYears(): number[] {
-  if (cachedExpenseYears) return cachedExpenseYears;
+  if (homeCache.expenseYears) return homeCache.expenseYears;
   const rows = db()
     .prepare("SELECT DISTINCT year FROM campaign_expense ORDER BY year DESC")
     .all() as Array<{ year: number }>;
-  cachedExpenseYears = rows.map((r) => r.year);
-  return cachedExpenseYears;
+  homeCache.expenseYears = rows.map((r) => r.year);
+  return homeCache.expenseYears;
 }
 
-let cachedAssetYears: number[] | null = null;
-
 export function getAssetYears(): number[] {
-  if (cachedAssetYears) return cachedAssetYears;
+  if (homeCache.assetYears) return homeCache.assetYears;
   const rows = db()
     .prepare("SELECT DISTINCT year FROM declared_assets ORDER BY year DESC")
     .all() as Array<{ year: number }>;
-  cachedAssetYears = rows.map((r) => r.year);
-  return cachedAssetYears;
+  homeCache.assetYears = rows.map((r) => r.year);
+  return homeCache.assetYears;
 }
 
 export type AssetsRankingRow = {
@@ -922,6 +919,28 @@ export type AssetsRankingRow = {
 
 export type AssetsRankingPage = { rows: AssetsRankingRow[]; total: number };
 
+function rankingPage<T>(rows: T[], order: "asc" | "desc" | undefined, limit: number, offset: number): T[] {
+  return order === "asc"
+    ? rows.slice(Math.max(0, rows.length - offset - limit), Math.max(0, rows.length - offset)).reverse()
+    : rows.slice(offset, offset + limit);
+}
+
+function rankingProfiles(ids: number[], year?: number): Map<number, Record<string, unknown>> {
+  if (!ids.length) return new Map();
+  const rows = db().prepare(
+    `SELECT p.id AS personId, p.canonical_name AS name,
+            ph.office, ph.party_abbr AS partyAbbr, ph.state, ph.year
+     FROM people p
+     LEFT JOIN politician_history ph ON ph.id = (
+       SELECT ph2.id FROM politician_history ph2
+       WHERE ph2.person_id = p.id${year != null ? " AND ph2.year = ?" : ""}
+       ORDER BY ph2.year DESC, ph2.id DESC LIMIT 1
+     )
+     WHERE p.id IN (${ids.map(() => "?").join(",")})`
+  ).all(...(year != null ? [year] : []), ...ids) as Array<Record<string, unknown>>;
+  return new Map(rows.map((row) => [row.personId as number, row]));
+}
+
 export function getAssetsRanking(opts: {
   year?: number;
   order?: "asc" | "desc";
@@ -930,7 +949,6 @@ export function getAssetsRanking(opts: {
 }): AssetsRankingPage {
   const limit = opts.limit ?? 50;
   const offset = opts.offset ?? 0;
-  const sortDir = opts.order === "asc" ? "ASC" : "DESC";
   const yearArgs = opts.year != null ? [opts.year] : [];
 
   // Each declaration is a full snapshot, so "all years" uses only each person's latest year
@@ -944,56 +962,45 @@ export function getAssetsRanking(opts: {
        ) latest ON latest.person_id = da.person_id AND latest.year = da.year`;
   const yearWhere = opts.year != null ? "WHERE da.year = ? AND da.person_id IS NOT NULL" : "WHERE da.person_id IS NOT NULL";
 
-  const total = (
-    db()
+  const cacheKey = opts.year ?? 0;
+  let aggregates = homeCache.assets.get(cacheKey);
+  if (!aggregates) {
+    aggregates = db()
       .prepare(
-        `SELECT count(*) AS n FROM (
-           SELECT da.person_id FROM declared_assets da ${latestYearJoin} ${yearWhere}
+        `WITH agg AS (
+           SELECT da.person_id, count(*) AS assetCount, coalesce(sum(da.value_cents), 0) AS assetTotalCents
+           FROM declared_assets da
+           ${latestYearJoin}
+           ${yearWhere}
            GROUP BY da.person_id
-         )`
+         )
+         SELECT a.person_id AS personId, a.assetCount, a.assetTotalCents
+         FROM agg a
+         JOIN people p ON p.id = a.person_id
+         ORDER BY a.assetTotalCents DESC, a.person_id`
       )
-      .get(...yearArgs) as { n: number }
-  ).n;
-
-  const rows = db()
-    .prepare(
-      `WITH agg AS (
-         SELECT da.person_id, count(*) AS assetCount, coalesce(sum(da.value_cents), 0) AS assetTotalCents
-         FROM declared_assets da
-         ${latestYearJoin}
-         ${yearWhere}
-         GROUP BY da.person_id
-       )
-       SELECT a.person_id AS personId, p.canonical_name AS name, a.assetCount, a.assetTotalCents,
-              ph.office, ph.party_abbr AS partyAbbr, ph.state, ph.year
-       FROM agg a
-       JOIN people p ON p.id = a.person_id
-       LEFT JOIN politician_history ph ON ph.id = (
-         -- unique row id avoids fan-out when a person has several candidacies in one year
-         SELECT ph2.id FROM politician_history ph2
-         WHERE ph2.person_id = a.person_id${opts.year != null ? " AND ph2.year = ?" : ""}
-         ORDER BY ph2.year DESC, ph2.id DESC
-         LIMIT 1
-       )
-       ORDER BY a.assetTotalCents ${sortDir}
-       LIMIT ? OFFSET ?`
-    )
-    .all(...yearArgs, ...yearArgs, limit, offset) as Array<Record<string, unknown>>;
-
+      .all(...yearArgs) as AssetTotal[];
+    homeCache.assets.set(cacheKey, aggregates);
+  }
+  const rows = rankingPage(aggregates, opts.order, limit, offset);
+  const profiles = rankingProfiles(rows.map((r) => r.personId), opts.year);
   const photoUrls = batchPhotoUrls(rows.map((r) => r.personId as number));
   return {
-    total,
-    rows: rows.map((r) => ({
-      personId: r.personId as number,
-      name: (r.name as string) ?? null,
-      assetCount: r.assetCount as number,
-      assetTotalCents: r.assetTotalCents as number,
-      office: (r.office as string) ?? null,
-      partyAbbr: (r.partyAbbr as string) ?? null,
-      state: (r.state as string) ?? null,
-      year: (r.year as number) ?? null,
-      photoUrl: photoUrls.get(r.personId as number) ?? null,
-    })),
+    total: aggregates.length,
+    rows: rows.map((aggregate) => {
+      const r: Record<string, unknown> = { ...aggregate, ...profiles.get(aggregate.personId) };
+      return {
+        personId: r.personId as number,
+        name: (r.name as string) ?? null,
+        assetCount: r.assetCount as number,
+        assetTotalCents: r.assetTotalCents as number,
+        office: (r.office as string) ?? null,
+        partyAbbr: (r.partyAbbr as string) ?? null,
+        state: (r.state as string) ?? null,
+        year: (r.year as number) ?? null,
+        photoUrl: photoUrls.get(r.personId as number) ?? null,
+      };
+    }),
   };
 }
 
@@ -1022,7 +1029,6 @@ export function getAssetsGrowthRanking(opts: {
 }): AssetsGrowthPage {
   const limit = opts.limit ?? 50;
   const offset = opts.offset ?? 0;
-  const sortDir = opts.order === "asc" ? "ASC" : "DESC";
 
   const CTE = `
     WITH bounds AS (
@@ -1051,33 +1057,25 @@ export function getAssetsGrowthRanking(opts: {
     )
   `;
 
-  const total = (
-    db().prepare(`${CTE} SELECT count(*) AS n FROM growth`).get() as { n: number }
-  ).n;
-
-  const rows = db()
-    .prepare(
-      `${CTE}
-       SELECT g.person_id AS personId, p.canonical_name AS name, g.firstYear, g.lastYear,
-              g.firstCents, g.lastCents, g.growthCents,
-              ph.office, ph.party_abbr AS partyAbbr, ph.state
-       FROM growth g
-       JOIN people p ON p.id = g.person_id
-       LEFT JOIN politician_history ph ON ph.id = (
-         SELECT ph2.id FROM politician_history ph2
-         WHERE ph2.person_id = g.person_id
-         ORDER BY ph2.year DESC, ph2.id DESC
-         LIMIT 1
-       )
-       ORDER BY g.growthCents ${sortDir}
-       LIMIT ? OFFSET ?`
-    )
-    .all(limit, offset) as Array<Record<string, unknown>>;
-
+  if (!homeCache.growth) {
+    homeCache.growth = db()
+      .prepare(
+        `${CTE}
+         SELECT g.person_id AS personId, g.firstYear, g.lastYear,
+                g.firstCents, g.lastCents, g.growthCents
+         FROM growth g
+         JOIN people p ON p.id = g.person_id
+         ORDER BY g.growthCents DESC, g.person_id`
+      )
+      .all() as AssetGrowth[];
+  }
+  const rows = rankingPage(homeCache.growth, opts.order, limit, offset);
+  const profiles = rankingProfiles(rows.map((r) => r.personId));
   const photoUrls = batchPhotoUrls(rows.map((r) => r.personId as number));
   return {
-    total,
-    rows: rows.map((r) => {
+    total: homeCache.growth.length,
+    rows: rows.map((aggregate) => {
+      const r: Record<string, unknown> = { ...aggregate, ...profiles.get(aggregate.personId) };
       const firstCents = r.firstCents as number;
       const lastCents = r.lastCents as number;
       return {
@@ -1099,6 +1097,9 @@ export function getAssetsGrowthRanking(opts: {
 }
 
 export function getTopSuppliers(year: number | null, limit = 10): TopSupplier[] {
+  const key = `${year ?? "all"}|${limit}`;
+  const cached = homeCache.suppliers.get(key);
+  if (cached) return cached;
   const sql = `
     SELECT
       supplier_cpf_cnpj AS cnpj,
@@ -1115,13 +1116,19 @@ export function getTopSuppliers(year: number | null, limit = 10): TopSupplier[] 
   `;
   const params = year != null ? [year, limit] : [limit];
   const rows = db().prepare(sql).all(...params) as Array<Record<string, unknown>>;
-  return rows.map((r) => ({
+  const suppliers = rows.map((r) => ({
     cnpj: r.cnpj as string,
     name: (r.name as string) ?? "(nome não disponível)",
     totalCents: r.totalCents as number,
     paymentCount: r.paymentCount as number,
     candidacyCount: r.candidacyCount as number,
   }));
+  // Bound the cache even if callers submit arbitrary years or limits.
+  if (homeCache.suppliers.size >= 64) {
+    homeCache.suppliers.delete(homeCache.suppliers.keys().next().value!);
+  }
+  homeCache.suppliers.set(key, suppliers);
+  return suppliers;
 }
 
 export type EntitySanction = {

@@ -51,6 +51,25 @@ O download também pode usar outro espelho com `ELOSYS_DB_URL` e
 `ELOSYS_DB_SHA256` (SHA-256 do ZIP); o arquivo deve conter `elosys.db` na raiz.
 Essas variáveis só são usadas quando o banco ainda não existe no volume.
 
+## Cache de produção
+
+Na inicialização em produção, o servidor prepara as estatísticas da home, os
+rankings de fornecedores por ano e os totais dos rankings de bens e crescimento.
+O container só atende requisições depois dessa preparação. Os logs `[elosys]`
+mostram o tempo de cada cálculo e terminam com `Home and ranking caches ready.`.
+
+Os resultados ficam em memória por processo. A paginação do `/ranking` reutiliza
+os totais e consulta somente os perfis e fotos da página exibida. A preparação
+consome CPU, leitura de disco e memória na subida do container; não é executada
+no build e o banco continua somente leitura. Reinicie o container ao substituir
+o banco para recalcular os caches. O modo de desenvolvimento calcula sob demanda.
+
+Verificação dos caches (Node 24 ou superior):
+
+```sh
+node --test tests/home-cache.test.cjs
+```
+
 ## Como está organizado
 
 - `src/lib/db.ts` — abre o `.db` em modo **readonly** (`better-sqlite3`).
